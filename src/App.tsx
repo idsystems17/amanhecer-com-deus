@@ -253,8 +253,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   // Clean play state on active day movement
   useEffect(() => {
     stopNarration();
-    setAudioError(null);
-    setIsEditing(false); // Cancel edit on day swap
+    setIsEditing(false);
   }, [selectedDay]);
 
   const isRead = userSettings.readDays.includes(selectedDay);

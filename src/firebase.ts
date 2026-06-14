@@ -106,6 +106,6 @@ export async function logoutUser() {
  */
 export function isUserAdmin(email: string | null | undefined): boolean {
   if (!email) return false;
-  const adminEmails = ['izisdiasduarte@gmail.com', 'idsystems17@gmail.com'];
+  const adminEmails = ['liviston63@gmail.com', 'idsystems17@gmail.com'];
   return adminEmails.includes(email.toLowerCase());
 }
