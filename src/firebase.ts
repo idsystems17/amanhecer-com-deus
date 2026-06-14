@@ -11,8 +11,11 @@ import firebaseConfig from '../firebase-applet-config.json';
 // Initialize Firebase App
 const app = initializeApp(firebaseConfig);
 
-// Initialize Firestore with Database ID from the config (CRITICAL CONSTRAINT)
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// Use named database if specified and not the default, otherwise use the default database
+const dbId = firebaseConfig.firestoreDatabaseId;
+export const db = (dbId && dbId !== '(default)')
+  ? getFirestore(app, dbId)
+  : getFirestore(app);
 
 // Initialize Authentication
 export const auth = getAuth();
