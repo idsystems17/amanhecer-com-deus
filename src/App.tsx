@@ -319,6 +319,11 @@ export default function App() {
     localStorage.setItem('devocional_accessibility', JSON.stringify(accessibility));
   }, [accessibility]);
 
+  // Aplica/remove classe 'dark' no <html> conforme o modo de contraste escolhido
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', accessibility.contrast === 'high-contrast-dark');
+  }, [accessibility.contrast]);
+
   useEffect(() => {
     localStorage.setItem('devocional_user_settings', JSON.stringify(userSettings));
   }, [userSettings]);
