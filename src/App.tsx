@@ -168,6 +168,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
 
   // Audio References
   const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const cancelTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recognitionRef = useRef<any>(null);
 
   // Firebase auth listener
@@ -420,10 +421,12 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
    * Action: triggers Audio Narration using Gemini TTS server proxy or local client-side synthesis.
    */
   const stopNarration = () => {
+    if (cancelTimeoutRef.current) {
+      clearTimeout(cancelTimeoutRef.current);
+      cancelTimeoutRef.current = null;
+    }
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
-      // Workaround para Chrome: cancel() pode não parar imediatamente
-      setTimeout(() => window.speechSynthesis.cancel(), 100);
     }
     speechUtteranceRef.current = null;
     setIsPlaying(false);
@@ -438,17 +441,21 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
 
     stopNarration();
 
-    const textToSpeak = `Amanhecer com Deus. ${activeDevotional.title}. Versículo: ${activeDevotional.verseText}, ${activeDevotional.verseReference}. Reflexão: ${activeDevotional.reflection}. Atitude prática: ${activeDevotional.action}. Oração: ${activeDevotional.prayer}`;
+    try {
+      const textToSpeak = `Amanhecer com Deus. ${activeDevotional.title}. Versículo: ${activeDevotional.verseText}, ${activeDevotional.verseReference}. Reflexão: ${activeDevotional.reflection}. Atitude prática: ${activeDevotional.action}. Oração: ${activeDevotional.prayer}`;
 
-    const utterance = new SpeechSynthesisUtterance(textToSpeak);
-    utterance.lang = 'pt-BR';
-    utterance.rate = accessibility.audioSpeed;
-    utterance.onstart = () => setIsPlaying(true);
-    utterance.onend = () => setIsPlaying(false);
-    utterance.onerror = () => setIsPlaying(false);
+      const utterance = new SpeechSynthesisUtterance(textToSpeak);
+      utterance.lang = 'pt-BR';
+      utterance.rate = accessibility.audioSpeed;
+      utterance.onstart = () => setIsPlaying(true);
+      utterance.onend = () => setIsPlaying(false);
+      utterance.onerror = () => setIsPlaying(false);
 
-    speechUtteranceRef.current = utterance;
-    window.speechSynthesis.speak(utterance);
+      speechUtteranceRef.current = utterance;
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      setIsPlaying(false);
+    }
   };
 
   const speakFeedback = (message: string) => {
