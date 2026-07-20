@@ -35,7 +35,9 @@ import {
   Trash2,
   User,
   X,
-  Heart
+  Heart,
+  Cloud,
+  CloudOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { getDevotionalForDay, getDayOfYear } from './data/devotionals';
@@ -177,6 +179,13 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
     }
   });
 
+  // Cloud sync state (progress synced to the logged-in Google account)
+  const [isSyncingProgress, setIsSyncingProgress] = useState(false);
+  const userSettingsRef = useRef(userSettings);
+  useEffect(() => {
+    userSettingsRef.current = userSettings;
+  }, [userSettings]);
+
   // Audio References
   const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const cancelTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -208,6 +217,44 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
     });
     return () => unsubscribe();
   }, []);
+
+  // Sync reading progress (Marcar como Lido / Favoritos) with the logged-in Google account,
+  // so it's the same on every device (celular, computador etc), not just this browser.
+  useEffect(() => {
+    if (!currentUser) return;
+    let isMounted = true;
+
+    const syncProgress = async () => {
+      setIsSyncingProgress(true);
+      try {
+        const userDocRef = doc(db, 'users', currentUser.uid);
+        const userDocSnap = await getDoc(userDocRef);
+        if (!isMounted) return;
+
+        if (userDocSnap.exists()) {
+          const cloud = userDocSnap.data() as Partial<UserSettings>;
+          const local = userSettingsRef.current;
+          setUserSettings({
+            notificationTime: cloud.notificationTime ?? local.notificationTime,
+            notificationsEnabled: cloud.notificationsEnabled ?? local.notificationsEnabled,
+            readDays: Array.from(new Set([...(cloud.readDays || []), ...local.readDays])),
+            starredDays: Array.from(new Set([...(cloud.starredDays || []), ...local.starredDays])),
+          });
+        } else {
+          await setDoc(userDocRef, userSettingsRef.current);
+        }
+      } catch (err) {
+        console.warn('Erro ao sincronizar progresso do usuário:', err);
+      } finally {
+        if (isMounted) setIsSyncingProgress(false);
+      }
+    };
+
+    syncProgress();
+    return () => {
+      isMounted = false;
+    };
+  }, [currentUser]);
 
   // Fetch devotional for selectedDay, either from Firestore (if customized) or from local mock structure
   useEffect(() => {
@@ -260,7 +307,13 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   }, [accessibility.fontFamily]);
   useEffect(() => {
     localStorage.setItem('devocional_user_settings', JSON.stringify(userSettings));
-  }, [userSettings]);
+    if (currentUser) {
+      const userDocRef = doc(db, 'users', currentUser.uid);
+      setDoc(userDocRef, userSettings, { merge: true }).catch((err) => {
+        console.warn('Erro ao salvar progresso na nuvem:', err);
+      });
+    }
+  }, [userSettings, currentUser]);
 
   // Clean play state on active day movement
   useEffect(() => {
@@ -768,7 +821,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
             {isAdmin ? (
               <span className="bg-white text-amber-700 text-[10px] uppercase font-black px-2 py-0.5 rounded-full ml-1">PASTOR AUTORIZADO</span>
             ) : (
-              <span className="bg-stone-350 text-stone-800 text-[10px] uppercase font-black px-2 py-0.5 rounded-full ml-1">VISITANTE</span>
+              <span className="bg-stone-350 text-stone-800 text-[10px] uppercase font-black px-2 py-0.5 rounded-full ml-1">PROGRESSO SINCRONIZADO</span>
             )}
           </div>
           <button 
@@ -1328,6 +1381,27 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                   Resetar Estudos
                 </button>
               </div>
+
+              {/* CLOUD SYNC STATUS: keeps "Marcar como Lido" the same across devices */}
+              {currentUser ? (
+                <div className="flex items-center gap-1.5 text-[10px] text-emerald-700 dark:text-emerald-400 font-bold pt-1">
+                  {isSyncingProgress ? (
+                    <div className="w-3 h-3 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin shrink-0" />
+                  ) : (
+                    <Cloud className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>Progresso salvo na nuvem ({currentUser.email})</span>
+                </div>
+              ) : (
+                <button
+                  onClick={handleGoogleLogin}
+                  disabled={isLoggingIn}
+                  className="w-full flex items-center justify-center gap-1.5 text-[10px] text-stone-500 dark:text-stone-400 font-bold pt-1 hover:text-amber-700 dark:hover:text-amber-400 disabled:opacity-50"
+                >
+                  <CloudOff className="w-3.5 h-3.5 shrink-0" />
+                  <span>{isLoggingIn ? 'Entrando...' : 'Entrar com Google para salvar seu progresso em todos os aparelhos'}</span>
+                </button>
+              )}
             </div>
 
             <button

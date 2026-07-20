@@ -78,5 +78,19 @@ service cloud.firestore {
       allow read: if isSignedIn() && (request.auth.uid == adminUid || isAdmin());
       allow write: if isAdmin();
     }
+
+    // Schema validation for a member's synced reading progress
+    function isValidUserSettings(data) {
+      return data.keys().hasOnly(['notificationTime', 'notificationsEnabled', 'readDays', 'starredDays'])
+        && (!('notificationTime' in data) || data.notificationTime is string)
+        && (!('notificationsEnabled' in data) || data.notificationsEnabled is bool)
+        && (!('readDays' in data) || (data.readDays is list && data.readDays.size() <= 365))
+        && (!('starredDays' in data) || (data.starredDays is list && data.starredDays.size() <= 365));
+    }
+
+    // Per-member reading progress (Marcar como Lido / Favoritos), synced across devices
+    match /users/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId && isValidUserSettings(incoming());
+    }
   }
 }
