@@ -928,6 +928,23 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
               <Share2 className="w-4 h-4 text-stone-600 dark:text-stone-300" />
             </button>
 
+            {/* VISIBLE Google login button: keeps "Marcar como Lido" synced across devices */}
+            {!currentUser && (
+              <button
+                onClick={handleGoogleLogin}
+                disabled={isLoggingIn}
+                className="min-h-[44px] px-3 sm:px-4 bg-white dark:bg-zinc-850 hover:bg-amber-50 rounded-xl border transition shrink-0 flex items-center gap-2 font-bold text-[11px] sm:text-xs text-stone-700 dark:text-stone-200 disabled:opacity-50"
+                title="Fazer login com Google para salvar seu progresso em todos os aparelhos"
+              >
+                {isLoggingIn ? (
+                  <div className="w-4 h-4 border-2 border-amber-800 border-t-transparent rounded-full animate-spin shrink-0" />
+                ) : (
+                  <User className="w-4 h-4 text-amber-700 shrink-0" />
+                )}
+                <span>Fazer login com Google</span>
+              </button>
+            )}
+
             <button
               onClick={() => setShowSettingsDrawer(true)}
               className="w-10 h-10 sm:w-11 sm:h-11 flex items-center justify-center bg-[#4e3629] text-white hover:bg-stone-850 rounded-xl transition shrink-0"
