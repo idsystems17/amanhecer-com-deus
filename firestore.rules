@@ -92,5 +92,19 @@ service cloud.firestore {
     match /users/{userId} {
       allow read, write: if isSignedIn() && request.auth.uid == userId && isValidUserSettings(incoming());
     }
+
+    // Schema validation for a member's prayer request submission
+    function isValidPrayerRequest(data) {
+      return data.keys().hasOnly(['name', 'request', 'createdAt'])
+        && data.name is string && data.name.size() <= 200
+        && data.request is string && data.request.size() >= 1 && data.request.size() <= 2000
+        && data.createdAt is string;
+    }
+
+    // Prayer requests: anyone can submit (anonymous or not), only the pastor can read them
+    match /prayer_requests/{requestId} {
+      allow create: if isValidPrayerRequest(incoming());
+      allow get, list: if isAdmin();
+    }
   }
 }
