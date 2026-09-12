@@ -46,14 +46,17 @@ import { AccessibilitySettings, UserSettings, Devotional, PrayerRequest } from '
 // Firebase Integrations
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, setDoc, deleteDoc, addDoc, collection, getDocs, query, orderBy } from 'firebase/firestore';
-import { 
-  db, 
-  auth, 
-  loginWithGoogle, 
-  logoutUser, 
-  isUserAdmin, 
-  handleFirestoreError, 
-  OperationType 
+import {
+  db,
+  auth,
+  loginAdmin,
+  sendAdminPasswordReset,
+  loginOrCreateMember,
+  resetMemberPin,
+  logoutUser,
+  isUserAdmin,
+  handleFirestoreError,
+  OperationType
 } from './firebase';
 
 // Portuguese spoken numbers helper
@@ -109,9 +112,26 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   const [isListeningVoice, setIsListeningVoice] = useState(false);
   const [voiceFeedback, setVoiceFeedback] = useState<string | null>(null);
 
-  // Firebase Auth states
-  const [currentUser, setCurrentUser] = useState<any>(null);
+  // Auth states: adminUser = pastor logged in with e-mail (Firebase Auth real);
+  // member = qualquer fiel logado com nome + senha de 4 dígitos (guardado localmente).
+  const [adminUser, setAdminUser] = useState<any>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [member, setMember] = useState<{ loginId: string; name: string } | null>(() => {
+    try {
+      const saved = localStorage.getItem('devocional_member');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+  const currentUser = adminUser || member;
+
+  // Login form state
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [loginInput, setLoginInput] = useState('');
+  const [loginPin, setLoginPin] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [wrongPinFor, setWrongPinFor] = useState<string | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // Firestore Core syncing state (falls back gracefully to localized static build)
@@ -185,27 +205,31 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   useEffect(() => {
     userSettingsRef.current = userSettings;
   }, [userSettings]);
+  const memberRef = useRef(member);
+  useEffect(() => {
+    memberRef.current = member;
+  }, [member]);
 
   // Audio References
   const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const cancelTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recognitionRef = useRef<any>(null);
 
-  // Firebase auth listener
+  // Firebase auth listener (Pastor/Admin real login)
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setCurrentUser(user);
+      setAdminUser(user);
       if (!user) {
         setIsAdmin(false);
         return;
       }
-      
+
       const isBootstrapAdmin = isUserAdmin(user.email);
       if (isBootstrapAdmin) {
         setIsAdmin(true);
         return;
       }
-      
+
       try {
         const adminDocRef = doc(db, 'admins', user.uid);
         const adminDocSnap = await getDoc(adminDocRef);
@@ -218,33 +242,43 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
     return () => unsubscribe();
   }, []);
 
-  // Sync reading progress (Marcar como Lido / Favoritos) with the logged-in Google account,
+  // Keep the logged-in member (nome + senha) remembered on this device
+  useEffect(() => {
+    try {
+      if (member) {
+        localStorage.setItem('devocional_member', JSON.stringify(member));
+      } else {
+        localStorage.removeItem('devocional_member');
+      }
+    } catch {
+      // localStorage indisponível — segue sem lembrar entre sessões
+    }
+  }, [member]);
+
+  // Sync reading progress (Marcar como Lido / Favoritos) with the logged-in member,
   // so it's the same on every device (celular, computador etc), not just this browser.
   useEffect(() => {
-    if (!currentUser) return;
+    if (!member) return;
     let isMounted = true;
 
     const syncProgress = async () => {
       setIsSyncingProgress(true);
       try {
-        const userDocRef = doc(db, 'users', currentUser.uid);
-        const userDocSnap = await getDoc(userDocRef);
+        const memberDocRef = doc(db, 'members', member.loginId);
+        const memberDocSnap = await getDoc(memberDocRef);
         if (!isMounted) return;
 
-        if (userDocSnap.exists()) {
-          const cloud = userDocSnap.data() as Partial<UserSettings>;
+        if (memberDocSnap.exists()) {
+          const cloud = memberDocSnap.data() as { readDays?: number[]; starredDays?: number[] };
           const local = userSettingsRef.current;
           setUserSettings({
-            notificationTime: cloud.notificationTime ?? local.notificationTime,
-            notificationsEnabled: cloud.notificationsEnabled ?? local.notificationsEnabled,
+            ...local,
             readDays: Array.from(new Set([...(cloud.readDays || []), ...local.readDays])),
             starredDays: Array.from(new Set([...(cloud.starredDays || []), ...local.starredDays])),
           });
-        } else {
-          await setDoc(userDocRef, userSettingsRef.current);
         }
       } catch (err) {
-        console.warn('Erro ao sincronizar progresso do usuário:', err);
+        console.warn('Erro ao sincronizar progresso do membro:', err);
       } finally {
         if (isMounted) setIsSyncingProgress(false);
       }
@@ -254,7 +288,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
     return () => {
       isMounted = false;
     };
-  }, [currentUser]);
+  }, [member]);
 
   // Fetch devotional for selectedDay, either from Firestore (if customized) or from local mock structure
   useEffect(() => {
@@ -307,13 +341,17 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   }, [accessibility.fontFamily]);
   useEffect(() => {
     localStorage.setItem('devocional_user_settings', JSON.stringify(userSettings));
-    if (currentUser) {
-      const userDocRef = doc(db, 'users', currentUser.uid);
-      setDoc(userDocRef, userSettings, { merge: true }).catch((err) => {
+    // Não depende de [member] de propósito: evita mandar um progresso vazio pra nuvem
+    // bem no instante do login, antes do efeito de sincronização (acima) terminar de buscar
+    // o progresso salvo. Assim que a busca termina, ela atualiza userSettings e cai aqui também.
+    const activeMember = memberRef.current;
+    if (activeMember) {
+      const memberDocRef = doc(db, 'members', activeMember.loginId);
+      setDoc(memberDocRef, { readDays: userSettings.readDays, starredDays: userSettings.starredDays }, { merge: true }).catch((err) => {
         console.warn('Erro ao salvar progresso na nuvem:', err);
       });
     }
-  }, [userSettings, currentUser]);
+  }, [userSettings]);
 
   // Clean play state on active day movement
   useEffect(() => {
@@ -324,48 +362,86 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   const isRead = userSettings.readDays.includes(selectedDay);
   const isStarred = userSettings.starredDays.includes(selectedDay);
 
-  // Google login flow for pastors and church members
-  const handleGoogleLogin = async () => {
+  // Opens the simple login form (nome+senha for fiéis, e-mail+senha for o pastor)
+  const openLoginModal = () => {
+    setLoginInput('');
+    setLoginPin('');
+    setLoginError(null);
+    setWrongPinFor(null);
+    setShowLoginModal(true);
+  };
+
+  // Single login flow: an "@" in the field means Pastor (e-mail real); otherwise it's a fiel (nome)
+  const handleLoginSubmit = async () => {
+    const input = loginInput.trim();
+    const pin = loginPin.trim();
+    if (!input || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+      setLoginError('Digite seu nome (ou e-mail, se você for o pastor) e uma senha de 4 números.');
+      return;
+    }
+
     setIsLoggingIn(true);
+    setLoginError(null);
     try {
-      if (auth.currentUser) {
-        await logoutUser();
-      }
-      const user = await loginWithGoogle();
-      if (user) {
-        let adminCheck = isUserAdmin(user.email);
-        
-        if (!adminCheck) {
-          try {
-            const adminDocRef = doc(db, 'admins', user.uid);
-            const adminDocSnap = await getDoc(adminDocRef);
-            adminCheck = adminDocSnap.exists();
-          } catch (err) {
-            console.error('Erro ao verificar admin na coleção:', err);
-          }
+      if (input.includes('@')) {
+        const user = await loginAdmin(input, pin);
+        const result = await loginOrCreateMember(input, pin);
+        if (result.status === 'ok' || result.status === 'new_account') {
+          setMember({ loginId: result.loginId, name: input });
         }
-        
-        setIsAdmin(adminCheck);
-        
-        if (adminCheck) {
-          speakFeedback("Olá! Acesso administrativo concedido.");
-          playAlarmeChime();
-        } else {
-          speakFeedback(`Olá ${user.displayName || 'Irmão'}! Você fez login com sucesso.`);
+        setShowLoginModal(false);
+        speakFeedback(`Olá! Acesso de pastor concedido para ${user.email}.`);
+        playAlarmeChime();
+      } else {
+        const result = await loginOrCreateMember(input, pin);
+        if (result.status === 'wrong_pin') {
+          setWrongPinFor(input);
+          setLoginError('Senha incorreta para esse nome. Se esqueceu, toque em "Criar senha nova" abaixo.');
+          return;
         }
+        setMember({ loginId: result.loginId, name: result.member.name });
+        setShowLoginModal(false);
+        speakFeedback(
+          result.status === 'new_account'
+            ? `Bem-vindo, ${result.member.name}! Sua conta foi criada.`
+            : `Olá, ${result.member.name}! Você entrou com sucesso.`
+        );
       }
     } catch (err) {
-      console.error("Login principal error: ", err);
-      speakFeedback("Falha ao entrar com o Google.");
+      console.error('Erro no login: ', err);
+      setLoginError('Não deu para entrar agora. Tente novamente em instantes.');
     } finally {
       setIsLoggingIn(false);
     }
   };
 
-  // Logout routine
+  // "Esqueci a senha": recria a senha na hora com o nome + senha nova digitados no mesmo formulário
+  const handleForgotMemberPin = async () => {
+    const input = loginInput.trim();
+    const pin = loginPin.trim();
+    if (!input || pin.length !== 4 || !/^\d{4}$/.test(pin)) return;
+    setIsLoggingIn(true);
+    try {
+      const result = await resetMemberPin(input, pin);
+      setMember({ loginId: result.loginId, name: result.member.name });
+      setShowLoginModal(false);
+      setWrongPinFor(null);
+      speakFeedback(`Senha nova criada para ${result.member.name}.`);
+    } catch (err) {
+      console.error('Erro ao criar senha nova: ', err);
+      setLoginError('Não deu para criar a senha nova agora. Tente novamente.');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  // Logout routine (fecha a sessão do pastor, se houver, e esquece o fiel logado neste aparelho)
   const handlePastorLogout = async () => {
     try {
-      await logoutUser();
+      if (adminUser) {
+        await logoutUser();
+      }
+      setMember(null);
       setIsEditing(false);
       speakFeedback("Sessão encerrada com sucesso.");
     } catch (err) {
@@ -407,7 +483,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
         action: editAction.trim(),
         prayer: editPrayer.trim(),
         category: editCategory.trim() || 'Estudo',
-        lastEditedBy: currentUser?.email || 'Pastor',
+        lastEditedBy: adminUser?.email || 'Pastor',
         lastEditedAt: new Date().toISOString()
       };
 
@@ -817,7 +893,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
         <div className={`w-full text-center py-2 px-4 flex flex-wrap items-center justify-center gap-3 text-xs font-sans font-bold shadow-xs ${isAdmin ? 'bg-amber-600 text-white' : 'bg-stone-100 dark:bg-zinc-900 dark:text-stone-300 border-b border-stone-200 dark:border-zinc-800 text-stone-700'}`}>
           <div className="flex items-center gap-2">
             <User className="w-3.5 h-3.5" />
-            <span>Conectado como {currentUser.email}</span>
+            <span>Conectado como {adminUser ? adminUser.email : member?.name}</span>
             {isAdmin ? (
               <span className="bg-white text-amber-700 text-[10px] uppercase font-black px-2 py-0.5 rounded-full ml-1">PASTOR AUTORIZADO</span>
             ) : (
@@ -839,7 +915,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
           
           {/* Logo & Brand title row */}
           <div className="flex items-center gap-4 text-left self-auto select-none">
-            <img src="/logo-sib.png" alt="SIB" className="w-16 h-16 sm:w-20 sm:h-20 shrink-0 flex-none object-contain" />
+            <img src="/logo-sib.png" alt="SIB" className="w-16 h-16 sm:w-20 sm:h-20 shrink-0 flex-none object-contain rounded-full ring-4 ring-amber-50 dark:ring-zinc-900 shadow-md" />
             <div>
               <h1 className="text-2xl sm:text-3xl lg:text-4xl font-serif font-black tracking-tight text-[#4e3629] dark:text-amber-100 leading-tight">
                 Amanhecer com Deus
@@ -857,9 +933,9 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
           </div>
 
           {/* Quick Date Display */}
-          <div className="text-center sm:text-right bg-amber-50/60 dark:bg-zinc-900/40 border border-[#E5E3DF] dark:border-neutral-850 px-5 py-2.5 rounded-2xl shrink-0">
+          <div className="text-center sm:text-right bg-gradient-to-br from-amber-50 to-amber-100/50 dark:from-zinc-900 dark:to-zinc-900/40 border border-[#E5E3DF] dark:border-neutral-850 px-5 py-2.5 rounded-2xl shrink-0 shadow-sm">
             <div className="text-stone-400 text-xs font-bold uppercase tracking-widest">Estudo de Hoje</div>
-            <div className="text-2xl font-serif font-black">{dateInfo.day} {dateInfo.monthLabel}</div>
+            <div className="text-2xl font-serif font-black text-[#4e3629] dark:text-white">{dateInfo.day} {dateInfo.monthLabel}</div>
             <div className="text-xs text-amber-800 dark:text-amber-400 font-medium italic">{dateInfo.weekday}</div>
           </div>
 
@@ -895,21 +971,8 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
           </div>
 
           <div className="flex items-center gap-1.5">
-            {/* Pastor Access Button */}
-            {!currentUser || !isAdmin ? (
-              <button
-                onClick={handleGoogleLogin}
-                disabled={isLoggingIn}
-                className="w-10 h-10 sm:w-11 sm:h-11 flex items-center justify-center bg-white dark:bg-zinc-850 hover:bg-amber-50 rounded-xl border transition shrink-0"
-                title={currentUser ? "Mudar conta de pastor (Login)" : "Acesso de Pastor (Login)"}
-              >
-                {isLoggingIn ? (
-                  <div className="w-4 h-4 border-2 border-amber-800 border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <Lock className="w-4 h-4 text-amber-850 dark:text-amber-400" />
-                )}
-              </button>
-            ) : (
+            {/* Pastor Edit Button — só aparece pra quem já é admin */}
+            {isAdmin && (
               <button
                 onClick={handleStartEditing}
                 disabled={isEditing}
@@ -928,20 +991,15 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
               <Share2 className="w-4 h-4 text-stone-600 dark:text-stone-300" />
             </button>
 
-            {/* VISIBLE Google login button: keeps "Marcar como Lido" synced across devices */}
+            {/* Único botão de login: fica visível até a pessoa entrar */}
             {!currentUser && (
               <button
-                onClick={handleGoogleLogin}
-                disabled={isLoggingIn}
-                className="min-h-[44px] px-3 sm:px-4 bg-white dark:bg-zinc-850 hover:bg-amber-50 rounded-xl border transition shrink-0 flex items-center gap-2 font-bold text-[11px] sm:text-xs text-stone-700 dark:text-stone-200 disabled:opacity-50"
-                title="Fazer login com Google para salvar seu progresso em todos os aparelhos"
+                onClick={openLoginModal}
+                className="min-h-[44px] px-3 sm:px-4 bg-white dark:bg-zinc-850 hover:bg-amber-50 rounded-xl border transition shrink-0 flex items-center gap-2 font-bold text-[11px] sm:text-xs text-stone-700 dark:text-stone-200"
+                title="Entrar com nome e senha para salvar seu progresso em todos os aparelhos"
               >
-                {isLoggingIn ? (
-                  <div className="w-4 h-4 border-2 border-amber-800 border-t-transparent rounded-full animate-spin shrink-0" />
-                ) : (
-                  <User className="w-4 h-4 text-amber-700 shrink-0" />
-                )}
-                <span>Fazer login com Google</span>
+                <User className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>Entrar</span>
               </button>
             )}
 
@@ -1210,68 +1268,66 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
             ☕ Controles Rápidos do Amanhecer
           </h3>
 
-          {/* 1. HUGE LISTEN TO DEVOTIONAL SPEAKER BUTTON - "Ouvir" */}
-          <button 
-            id="play_audio_narrate"
-            onClick={handlePlayNarration}
-            disabled={isLoadingFirebase}
-            className="w-full h-20 px-6 bg-[#B45309] hover:bg-amber-700 text-white rounded-3xl flex items-center justify-center gap-4 shadow-lg active:scale-95 transition-all text-left"
-            title="Narrar devocional por voz"
-          >
-            <div className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center shrink-0">
-              {isPlaying ? (
-                <VolumeX className="w-6 h-6 text-white stroke-[2.5px]" />
-              ) : (
-                <Volume2 className="w-6 h-6 text-white stroke-[2.5px]" />
-              )}
-            </div>
-
-            <div className="text-left select-none flex-1">
-              <p className="text-2xl font-black tracking-tight leading-none mb-1">
-                {isPlaying ? 'Parar' : 'Ouvir'}
-              </p>
-              <p className="text-xs opacity-85 leading-snug">
-                {isPlaying ? 'Toque para silenciar' : 'Escutar de forma simples'}
-              </p>
-            </div>
-          </button>
-
-          {/* 2. ELDER VOICE COMMAND MICROPHONE BUTTON (SEARCH BY SPEAKING) - "Falar" */}
-          <div className="space-y-2">
+          {/* 1 & 2. OUVIR + FALAR lado a lado — ações irmãs, mesma altura, menos rolagem */}
+          <div className="grid grid-cols-2 gap-3">
             <button
-              onClick={handleVoiceSearch}
-              className={`w-full h-20 px-6 rounded-3xl flex items-center justify-center gap-4 shadow-md transition-all border-2 text-left
-                ${isListeningVoice 
-                  ? 'bg-red-50 border-red-500 text-red-950 animate-pulse' 
-                  : 'bg-amber-100 hover:bg-amber-200 border-amber-300 text-amber-950'}
-              `}
-              title="Dar comando por voz"
+              id="play_audio_narrate"
+              onClick={handlePlayNarration}
+              disabled={isLoadingFirebase}
+              className="h-24 sm:h-20 px-3 sm:px-5 bg-[#B45309] hover:bg-amber-700 text-white rounded-2xl flex flex-col sm:flex-row items-center justify-center sm:justify-start gap-1.5 sm:gap-4 shadow-lg active:scale-95 transition-all text-center sm:text-left"
+              title="Narrar devocional por voz"
             >
-              <div className={`w-12 h-12 rounded-full flex items-center justify-center shrink-0 ${isListeningVoice ? 'bg-red-500 text-white' : 'bg-amber-600 text-white font-bold'}`}>
-                <Mic className="w-5 h-5" />
+              <div className="w-10 h-10 sm:w-12 sm:h-12 bg-white/20 rounded-full flex items-center justify-center shrink-0">
+                {isPlaying ? (
+                  <VolumeX className="w-5 h-5 sm:w-6 sm:h-6 text-white stroke-[2.5px]" />
+                ) : (
+                  <Volume2 className="w-5 h-5 sm:w-6 sm:h-6 text-white stroke-[2.5px]" />
+                )}
               </div>
-              <div className="text-left select-none flex-1">
-                <p className="text-2xl font-black leading-none mb-1">
-                  {isListeningVoice ? 'Ouvindo...' : 'Falar'}
+              <div className="select-none min-w-0">
+                <p className="text-lg sm:text-2xl font-black tracking-tight leading-none mb-1">
+                  {isPlaying ? 'Parar' : 'Ouvir'}
                 </p>
-                <p className="text-xs opacity-85 leading-snug">
-                  {isListeningVoice ? 'Diga o comando agora...' : 'Pesquise ou mude de dia por voz'}
+                <p className="hidden sm:block text-xs opacity-85 leading-snug">
+                  {isPlaying ? 'Toque para silenciar' : 'Escutar de forma simples'}
                 </p>
               </div>
             </button>
 
-            {/* Voice Helper Info / feedback transcript */}
-            <div className="bg-stone-50 dark:bg-zinc-900 border border-[#E5E3DF] dark:border-zinc-800 p-3 rounded-xl text-center">
-              {voiceFeedback ? (
-                <p className="text-xs font-bold text-amber-900 dark:text-amber-400 italic">
-                  🔊 {voiceFeedback}
+            <button
+              onClick={handleVoiceSearch}
+              className={`h-24 sm:h-20 px-3 sm:px-5 rounded-2xl flex flex-col sm:flex-row items-center justify-center sm:justify-start gap-1.5 sm:gap-4 shadow-md transition-all border-2 text-center sm:text-left
+                ${isListeningVoice
+                  ? 'bg-red-50 border-red-500 text-red-950 animate-pulse'
+                  : 'bg-amber-100 hover:bg-amber-200 border-amber-300 text-amber-950'}
+              `}
+              title="Dar comando por voz"
+            >
+              <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full flex items-center justify-center shrink-0 ${isListeningVoice ? 'bg-red-500 text-white' : 'bg-amber-600 text-white font-bold'}`}>
+                <Mic className="w-4 h-4 sm:w-5 sm:h-5" />
+              </div>
+              <div className="select-none min-w-0">
+                <p className="text-lg sm:text-2xl font-black leading-none mb-1">
+                  {isListeningVoice ? 'Ouvindo...' : 'Falar'}
                 </p>
-              ) : (
-                <p className="text-[11px] text-stone-500 leading-normal">
-                  💡 <strong>Comando de Voz Fácil:</strong> Clique em <strong>Falar</strong> e diga <i>"hoje"</i>, <i>"dia 15"</i> ou <i>"avançar"</i>.
+                <p className="hidden sm:block text-xs opacity-85 leading-snug">
+                  {isListeningVoice ? 'Diga o comando agora...' : 'Pesquise ou mude de dia por voz'}
                 </p>
-              )}
-            </div>
+              </div>
+            </button>
+          </div>
+
+          {/* Voice Helper Info / feedback transcript */}
+          <div className="bg-stone-50 dark:bg-zinc-900 border border-[#E5E3DF] dark:border-zinc-800 p-3 rounded-xl text-center">
+            {voiceFeedback ? (
+              <p className="text-xs font-bold text-amber-900 dark:text-amber-400 italic">
+                🔊 {voiceFeedback}
+              </p>
+            ) : (
+              <p className="text-[11px] text-stone-500 leading-normal">
+                💡 <strong>Comando de Voz Fácil:</strong> Clique em <strong>Falar</strong> e diga <i>"hoje"</i>, <i>"dia 15"</i> ou <i>"avançar"</i>.
+              </p>
+            )}
           </div>
 
           {/* 3. SIMPLER/COMPACT MARK AS READ ACTION BUTTON */}
@@ -1369,28 +1425,30 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
           📈 Seu Progresso e Ferramentas Diárias
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-12">
-          
-          {/* BENTO BLOCK A: ANNUAL PROGRESS OF READ DEVOTIONALS */}
-          <div className="bg-white dark:bg-zinc-910 p-6 rounded-2xl border border-stone-200/60 dark:border-zinc-800 space-y-4">
-            <h4 className="text-sm font-bold uppercase tracking-widest text-stone-500 font-sans flex items-center gap-1.5">
-              <BookOpen className="w-4 h-4 text-amber-700" />
-              Progresso do Ano
-            </h4>
-            
+        <div className="mb-12">
+
+          {/* PROGRESS CARD: ANNUAL PROGRESS OF READ DEVOTIONALS */}
+          <div className="bg-white dark:bg-zinc-910 p-6 rounded-3xl border border-stone-200/60 dark:border-zinc-800 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-bold uppercase tracking-widest text-stone-500 font-sans flex items-center gap-1.5">
+                <BookOpen className="w-4 h-4 text-amber-700" />
+                Progresso do Ano
+              </h4>
+              <span className="text-2xl font-serif font-black text-amber-800 dark:text-amber-400">{progressPercent}%</span>
+            </div>
+
             <div className="space-y-2">
               <div className="flex justify-between items-end">
                 <span className="text-xs font-bold text-stone-400">Dias Lidos</span>
-                <span className="text-xl font-serif italic text-stone-600 font-bold">{totalReadCount}/365</span>
+                <span className="text-xl font-serif italic text-stone-600 dark:text-stone-300 font-bold">{totalReadCount}/365</span>
               </div>
-              <div className="h-4.5 w-full bg-stone-100 dark:bg-zinc-800 rounded-full overflow-hidden border border-[#E5E3DF]/50 p-0.5">
-                <div 
-                  className="h-full bg-gradient-to-r from-amber-600 to-amber-500 shadow-inner rounded-full transition-all duration-300 pointer-events-none" 
+              <div className="h-5 w-full bg-stone-100 dark:bg-zinc-800 rounded-full overflow-hidden border border-[#E5E3DF]/50 p-0.5">
+                <div
+                  className="h-full bg-gradient-to-r from-amber-600 to-amber-400 shadow-inner rounded-full transition-all duration-500 pointer-events-none"
                   style={{ width: `${Math.max(4, progressPercent)}%` }}
                 />
               </div>
-              <div className="flex justify-between items-center text-[10px] text-stone-400 font-mono">
-                <span>{progressPercent}% concluído</span>
+              <div className="flex justify-end items-center text-[10px] text-stone-400 font-mono">
                 <button
                   onClick={handleResetProgress}
                   className="text-red-650 dark:text-red-400 hover:underline font-bold"
@@ -1407,16 +1465,15 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                   ) : (
                     <Cloud className="w-3.5 h-3.5 shrink-0" />
                   )}
-                  <span>Progresso salvo na nuvem ({currentUser.email})</span>
+                  <span>Progresso salvo na nuvem ({adminUser ? adminUser.email : member?.name})</span>
                 </div>
               ) : (
                 <button
-                  onClick={handleGoogleLogin}
-                  disabled={isLoggingIn}
-                  className="w-full flex items-center justify-center gap-1.5 text-[10px] text-stone-500 dark:text-stone-400 font-bold pt-1 hover:text-amber-700 dark:hover:text-amber-400 disabled:opacity-50"
+                  onClick={openLoginModal}
+                  className="w-full flex items-center justify-center gap-1.5 text-[10px] text-stone-500 dark:text-stone-400 font-bold pt-1 hover:text-amber-700 dark:hover:text-amber-400"
                 >
                   <CloudOff className="w-3.5 h-3.5 shrink-0" />
-                  <span>{isLoggingIn ? 'Entrando...' : 'Entrar com Google para salvar seu progresso em todos os aparelhos'}</span>
+                  <span>Entrar com nome e senha para salvar seu progresso em todos os aparelhos</span>
                 </button>
               )}
             </div>
@@ -1437,27 +1494,29 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: "auto" }}
                   exit={{ opacity: 0, height: 0 }}
-                  className="bg-stone-50 dark:bg-zinc-900 rounded-xl border border-[#E5E3DF]/60 p-3 space-y-3 overflow-hidden"
+                  className="bg-gradient-to-b from-amber-50/60 to-stone-50 dark:from-zinc-900 dark:to-zinc-900 rounded-2xl border border-[#E5E3DF]/60 dark:border-zinc-800 p-4 space-y-4 overflow-hidden shadow-inner"
                 >
                   <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300">Escolha uma data:</span>
+                    <span className="text-xs font-black uppercase tracking-wider text-amber-800 dark:text-amber-300">Escolha uma data</span>
                     <button
                       onClick={() => setIsCalendarOpen(false)}
-                      className="text-[10px] text-stone-500 hover:underline font-bold"
+                      className="w-7 h-7 flex items-center justify-center rounded-full bg-white dark:bg-zinc-800 border border-stone-200 dark:border-zinc-700 text-stone-500 hover:text-stone-800 dark:hover:text-white transition"
+                      title="Fechar calendário"
                     >
-                      Fechar [✕]
+                      <X className="w-3.5 h-3.5" />
                     </button>
                   </div>
 
                   {/* Legenda */}
-                  <div className="flex items-center gap-3 text-[9px] text-stone-500">
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-amber-200 ring-1 ring-amber-500 inline-block" />Selecionado</span>
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-amber-100 dark:bg-amber-900 inline-block" />Hoje</span>
-                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-100 inline-block" />Lido</span>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] font-semibold text-stone-500 dark:text-stone-400 bg-white/70 dark:bg-zinc-950/40 rounded-xl px-3 py-2">
+                    <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full ring-2 ring-amber-500 bg-amber-200 inline-block" />Selecionado</span>
+                    <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-amber-100 dark:bg-amber-900 border border-amber-400 inline-block" />Hoje</span>
+                    <span className="flex items-center gap-1.5"><Check className="w-3.5 h-3.5 text-emerald-600" />Lido</span>
+                    <span className="flex items-center gap-1.5"><Star className="w-3 h-3 text-amber-500 fill-amber-500" />Favorito</span>
                   </div>
 
                   {/* Calendário agrupado por mês */}
-                  <div className="space-y-3 max-h-[260px] overflow-y-auto pr-0.5 select-none">
+                  <div className="space-y-4 max-h-[300px] overflow-y-auto pr-1 select-none">
                     {Array.from({ length: 12 }, (_, monthIdx) => {
                       const year = new Date().getFullYear();
                       const daysInMonth: { dayOfYear: number; dayNum: number }[] = [];
@@ -1471,13 +1530,17 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                       }
                       const monthName = new Date(year, monthIdx, 1)
                         .toLocaleDateString('pt-BR', { month: 'long' });
+                      const monthReadCount = daysInMonth.filter(d => userSettings.readDays.includes(d.dayOfYear)).length;
 
                       return (
                         <div key={monthIdx}>
-                          <div className="text-[9px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-zinc-900 px-2 py-1 rounded mb-1 sticky top-0 z-10">
-                            {monthName}
+                          <div className="flex items-center justify-between mb-1.5 sticky top-0 z-10 bg-gradient-to-b from-amber-50 dark:from-zinc-900 to-transparent pb-1">
+                            <span className="text-[11px] font-black uppercase tracking-widest text-amber-800 dark:text-amber-300">
+                              {monthName}
+                            </span>
+                            <span className="text-[10px] font-bold text-stone-400">{monthReadCount}/{daysInMonth.length}</span>
                           </div>
-                          <div className="grid grid-cols-7 gap-1">
+                          <div className="grid grid-cols-7 gap-1.5">
                             {daysInMonth.map(({ dayOfYear, dayNum }) => {
                               const isDayRead = userSettings.readDays.includes(dayOfYear);
                               const isDayStarred = userSettings.starredDays.includes(dayOfYear);
@@ -1489,18 +1552,20 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                                   key={dayOfYear}
                                   onClick={() => setSelectedDay(dayOfYear)}
                                   title={`${dayNum} de ${monthName}`}
-                                  className={`text-xs py-1.5 rounded font-bold transition-all leading-none ${
+                                  className={`relative aspect-square text-xs rounded-full font-bold transition-all leading-none flex items-center justify-center ${
                                     isCurrent
-                                      ? 'ring-2 ring-amber-500 bg-amber-200 text-amber-950 scale-105'
+                                      ? 'ring-2 ring-amber-500 ring-offset-1 ring-offset-stone-50 dark:ring-offset-zinc-900 bg-amber-200 text-amber-950 scale-110 shadow'
                                       : isToday
-                                      ? 'bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200 font-black'
+                                      ? 'bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200 font-black border border-amber-400'
                                       : isDayRead
-                                      ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-950 dark:text-emerald-200'
-                                      : 'bg-stone-50 dark:bg-zinc-800 text-stone-600 dark:text-stone-400 border border-stone-200/40'
+                                      ? 'bg-emerald-500 text-white shadow-sm'
+                                      : 'bg-white dark:bg-zinc-800 text-stone-500 dark:text-stone-400 border border-stone-200/60 dark:border-zinc-700 hover:border-amber-400'
                                   }`}
                                 >
-                                  {dayNum}
-                                  {isDayStarred && <span className="text-[6px] text-amber-500 block leading-none">★</span>}
+                                  {isDayRead && !isCurrent ? <Check className="w-3.5 h-3.5 stroke-[3px]" /> : dayNum}
+                                  {isDayStarred && (
+                                    <Star className="w-2.5 h-2.5 text-amber-500 fill-amber-400 absolute -top-1 -right-1 drop-shadow" />
+                                  )}
                                 </button>
                               );
                             })}
@@ -1662,7 +1727,16 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
 
               {/* Scrollable controls list */}
               <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                
+
+                {/* LIVE PREVIEW: mostra na hora como a letra/contraste vão ficar, sem fechar o painel */}
+                <div className={`rounded-2xl border p-4 transition-colors duration-200 ${getThemeBorder()} ${getThemeBg()}`}>
+                  <p className={`text-[10px] font-black uppercase tracking-widest mb-2 ${getAccentText()}`}>Veja como fica</p>
+                  <blockquote className={`${accessibility.fontFamily === 'sans' ? 'font-sans' : 'font-serif'} italic leading-relaxed transition-all duration-200 ${getThemeText()} ${accessibility.fontSize === 'normal' ? 'text-base' : accessibility.fontSize === 'large' ? 'text-lg font-bold' : 'text-xl font-black'}`}>
+                    &ldquo;O Senhor é o meu pastor, nada me faltará.&rdquo;
+                  </blockquote>
+                  <p className={`mt-2 text-xs font-extrabold uppercase tracking-widest ${getAccentText()}`}>— Salmos 23:1</p>
+                </div>
+
                 {/* 1. Contrast styles settings panel */}
                 <div>
                   <h4 className="font-bold text-stone-850 dark:text-stone-300 text-sm mb-3 border-l-2 border-amber-500 pl-2 uppercase tracking-wide font-mono">
@@ -1677,9 +1751,14 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                       <button
                         key={opt.id}
                         onClick={() => setAccessibility(prev => ({ ...prev, contrast: opt.id as any }))}
-                        className={`w-full min-h-[50px] p-3 text-left font-bold rounded-xl border-2 transition text-sm ${accessibility.contrast === opt.id ? 'border-amber-500 bg-amber-50 text-amber-950 font-black' : 'border-stone-200 dark:border-zinc-800 hover:bg-stone-50'}`}
+                        className={`w-full min-h-[50px] p-3 flex items-center justify-between text-left font-bold rounded-xl border-2 transition text-sm ${accessibility.contrast === opt.id ? 'border-amber-500 bg-amber-50 text-amber-950 font-black shadow-sm' : 'border-stone-200 dark:border-zinc-800 hover:bg-stone-50 dark:hover:bg-zinc-800'}`}
                       >
-                        {opt.label}
+                        <span>{opt.label}</span>
+                        {accessibility.contrast === opt.id && (
+                          <span className="w-5 h-5 rounded-full bg-amber-600 text-white flex items-center justify-center shrink-0">
+                            <Check className="w-3 h-3 stroke-[3px]" />
+                          </span>
+                        )}
                       </button>
                     ))}
                   </div>
@@ -1755,6 +1834,20 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                       </button>
                     ))}
                   </div>
+                  <button
+                    onClick={() => {
+                      if (!('speechSynthesis' in window)) return;
+                      window.speechSynthesis.cancel();
+                      const sample = new SpeechSynthesisUtterance('Assim vai soar a narração dos devocionais.');
+                      sample.lang = 'pt-BR';
+                      sample.rate = accessibility.audioSpeed;
+                      window.speechSynthesis.speak(sample);
+                    }}
+                    className="mt-2 w-full min-h-[44px] flex items-center justify-center gap-2 text-xs font-bold text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl hover:bg-amber-100 transition"
+                  >
+                    <Volume2 className="w-4 h-4" />
+                    Ouvir um exemplo nessa velocidade
+                  </button>
                 </div>
 
               </div>
@@ -1769,6 +1862,94 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                 </button>
               </div>
 
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* SIMPLE LOGIN MODAL: nome + senha de 4 dígitos (fiéis) / e-mail + senha (pastor) */}
+      <AnimatePresence>
+        {showLoginModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 0.5 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowLoginModal(false)}
+              className="absolute inset-0 bg-black"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="relative w-full max-w-sm bg-white dark:bg-zinc-900 text-stone-900 dark:text-white rounded-3xl shadow-2xl p-6 space-y-4"
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="font-serif font-black text-xl">Entrar</h3>
+                <button
+                  onClick={() => setShowLoginModal(false)}
+                  className="p-2 text-stone-400 hover:text-stone-700 dark:hover:text-white"
+                  title="Fechar"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block text-xs font-bold uppercase tracking-wider text-stone-500">Nome</label>
+                <input
+                  type="text"
+                  value={loginInput}
+                  onChange={(e) => { setLoginInput(e.target.value); setWrongPinFor(null); setLoginError(null); }}
+                  placeholder="Ex: Maria Silva"
+                  className="w-full p-3 border rounded-xl text-base bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
+                  autoFocus
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="block text-xs font-bold uppercase tracking-wider text-stone-500">Senha (4 números)</label>
+                <input
+                  type="tel"
+                  inputMode="numeric"
+                  maxLength={4}
+                  value={loginPin}
+                  onChange={(e) => setLoginPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  placeholder="0000"
+                  className="w-full p-3 border rounded-xl text-2xl tracking-[0.5em] text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
+                />
+              </div>
+
+              {loginError && (
+                <p className="text-xs text-red-600 dark:text-red-400 font-bold">{loginError}</p>
+              )}
+
+              <button
+                onClick={handleLoginSubmit}
+                disabled={isLoggingIn}
+                className="w-full min-h-[50px] bg-amber-600 hover:bg-amber-700 text-white font-black rounded-xl flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {isLoggingIn ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <Lock className="w-4 h-4" />
+                )}
+                <span>Entrar</span>
+              </button>
+
+              {wrongPinFor && (
+                <button
+                  onClick={handleForgotMemberPin}
+                  disabled={isLoggingIn}
+                  className="w-full text-xs font-bold text-amber-700 dark:text-amber-400 hover:underline disabled:opacity-50"
+                >
+                  Esqueci a senha — criar senha nova para "{wrongPinFor}"
+                </button>
+              )}
+
+              <p className="text-[11px] text-stone-400 text-center">
+                Primeira vez? É só digitar um nome e uma senha — sua conta é criada na hora.
+              </p>
             </motion.div>
           </div>
         )}
