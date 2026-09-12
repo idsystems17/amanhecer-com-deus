@@ -995,7 +995,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
             {!currentUser && (
               <button
                 onClick={openLoginModal}
-                className="min-h-[44px] px-4 sm:px-6 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/50 border border-amber-200 dark:border-amber-800 rounded-xl transition shrink-0 flex items-center gap-2 font-bold text-[11px] sm:text-xs text-amber-900 dark:text-amber-200"
+                className="min-h-[44px] px-4 sm:px-6 bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/50 border-2 border-[#4e3629] dark:border-amber-700 rounded-xl transition shrink-0 flex items-center gap-2 font-bold text-[11px] sm:text-xs text-amber-900 dark:text-amber-200"
                 title="Entrar com nome e senha para salvar seu progresso em todos os aparelhos"
               >
                 <User className="w-4 h-4 text-amber-700 shrink-0" />
