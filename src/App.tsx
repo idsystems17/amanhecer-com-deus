@@ -1946,6 +1946,11 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                   className="w-full p-3 border rounded-xl text-base bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
                   autoFocus
                 />
+                <p className="text-xs text-amber-800 dark:text-amber-300 font-bold">
+                  {isEmailLogin
+                    ? 'Entrando como pastor (com e-mail).'
+                    : 'É o pastor? Digite seu e-mail aqui no lugar do nome.'}
+                </p>
               </div>
 
               <div className="space-y-1">
