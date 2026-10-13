@@ -131,7 +131,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   const [loginInput, setLoginInput] = useState('');
   const [loginPin, setLoginPin] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
-  const [wrongPinFor, setWrongPinFor] = useState<string | null>(null);
+  const [loginInfo, setLoginInfo] = useState<string | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // Firestore Core syncing state (falls back gracefully to localized static build)
@@ -367,36 +367,41 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
     setLoginInput('');
     setLoginPin('');
     setLoginError(null);
-    setWrongPinFor(null);
+    setLoginInfo(null);
     setShowLoginModal(true);
   };
+
+  const isEmailLogin = loginInput.includes('@');
 
   // Single login flow: an "@" in the field means Pastor (e-mail real); otherwise it's a fiel (nome)
   const handleLoginSubmit = async () => {
     const input = loginInput.trim();
     const pin = loginPin.trim();
-    if (!input || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+    const pinOk = isEmailLogin ? pin.length >= 4 : /^\d{4}$/.test(pin);
+    if (!input || !pinOk) {
       setLoginError('Digite seu nome (ou e-mail, se você for o pastor) e uma senha de 4 números.');
       return;
     }
 
     setIsLoggingIn(true);
     setLoginError(null);
+    setLoginInfo(null);
     try {
-      if (input.includes('@')) {
+      if (isEmailLogin) {
         const user = await loginAdmin(input, pin);
-        const result = await loginOrCreateMember(input, pin);
-        if (result.status === 'ok' || result.status === 'new_account') {
-          setMember({ loginId: result.loginId, name: input });
+        // O pastor já provou quem é pelo Firebase; se a senha mudou, só atualiza o progresso salvo
+        let result = await loginOrCreateMember(input, pin);
+        if (result.status === 'wrong_pin') {
+          result = { status: 'ok', ...(await resetMemberPin(input, pin)) };
         }
+        setMember({ loginId: result.loginId, name: input });
         setShowLoginModal(false);
         speakFeedback(`Olá! Acesso de pastor concedido para ${user.email}.`);
         playAlarmeChime();
       } else {
         const result = await loginOrCreateMember(input, pin);
         if (result.status === 'wrong_pin') {
-          setWrongPinFor(input);
-          setLoginError('Senha incorreta para esse nome. Se esqueceu, toque em "Criar senha nova" abaixo.');
+          setLoginError('Senha incorreta para esse nome. Se esqueceu, toque em "Esqueci minha senha" abaixo.');
           return;
         }
         setMember({ loginId: result.loginId, name: result.member.name });
@@ -407,26 +412,54 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
             : `Olá, ${result.member.name}! Você entrou com sucesso.`
         );
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Erro no login: ', err);
-      setLoginError('Não deu para entrar agora. Tente novamente em instantes.');
+      if (err?.code === 'auth/wrong-password') {
+        setLoginError('Senha incorreta. Se esqueceu, toque em "Esqueci minha senha" abaixo.');
+      } else if (err?.code === 'auth/too-many-requests') {
+        setLoginError('Muitas tentativas seguidas. Espere alguns minutos ou toque em "Esqueci minha senha".');
+      } else {
+        setLoginError('Não deu para entrar agora. Tente novamente em instantes.');
+      }
     } finally {
       setIsLoggingIn(false);
     }
   };
 
-  // "Esqueci a senha": recria a senha na hora com o nome + senha nova digitados no mesmo formulário
-  const handleForgotMemberPin = async () => {
+  // "Esqueci minha senha":
+  // - fiel (nome): a senha só guarda o progresso de leitura, então cria a senha nova na hora, sem provar nada;
+  // - pastor (e-mail): ele edita os devocionais e lê os pedidos de oração, então vai pelo e-mail do Firebase.
+  const handleForgotPin = async () => {
     const input = loginInput.trim();
     const pin = loginPin.trim();
-    if (!input || pin.length !== 4 || !/^\d{4}$/.test(pin)) return;
+    setLoginError(null);
+    setLoginInfo(null);
+
+    if (isEmailLogin) {
+      if (!input) return;
+      setIsLoggingIn(true);
+      try {
+        await sendAdminPasswordReset(input);
+        setLoginInfo(`Enviamos um e-mail para ${input}. Abra o link, crie uma senha nova (mínimo 6 letras ou números) e volte aqui para entrar com ela. Se não chegar, olhe no Spam.`);
+      } catch (err) {
+        console.error('Erro ao enviar e-mail de nova senha: ', err);
+        setLoginError('Não deu para enviar o e-mail agora. Confira se o e-mail está certo e tente de novo.');
+      } finally {
+        setIsLoggingIn(false);
+      }
+      return;
+    }
+
+    if (!input || !/^\d{4}$/.test(pin)) {
+      setLoginInfo('Digite seu nome e, no campo Senha, os 4 números que você quer usar a partir de agora. Depois toque em "Esqueci minha senha" de novo.');
+      return;
+    }
     setIsLoggingIn(true);
     try {
       const result = await resetMemberPin(input, pin);
       setMember({ loginId: result.loginId, name: result.member.name });
       setShowLoginModal(false);
-      setWrongPinFor(null);
-      speakFeedback(`Senha nova criada para ${result.member.name}.`);
+      speakFeedback(`Senha nova criada para ${result.member.name}. Sua leitura continua de onde parou.`);
     } catch (err) {
       console.error('Erro ao criar senha nova: ', err);
       setLoginError('Não deu para criar a senha nova agora. Tente novamente.');
@@ -1900,7 +1933,13 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                 <input
                   type="text"
                   value={loginInput}
-                  onChange={(e) => { setLoginInput(e.target.value); setWrongPinFor(null); setLoginError(null); }}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setLoginInput(value);
+                    setLoginError(null);
+                    setLoginInfo(null);
+                    if (!value.includes('@')) setLoginPin(p => p.replace(/\D/g, '').slice(0, 4));
+                  }}
                   placeholder="Ex: Maria Silva"
                   className="w-full p-3 border rounded-xl text-base bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
                   autoFocus
@@ -1908,20 +1947,35 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
               </div>
 
               <div className="space-y-1">
-                <label className="block text-xs font-bold uppercase tracking-wider text-stone-500">Senha (4 números)</label>
-                <input
-                  type="tel"
-                  inputMode="numeric"
-                  maxLength={4}
-                  value={loginPin}
-                  onChange={(e) => setLoginPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                  placeholder="0000"
-                  className="w-full p-3 border rounded-xl text-2xl tracking-[0.5em] text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
-                />
+                <label className="block text-xs font-bold uppercase tracking-wider text-stone-500">
+                  {isEmailLogin ? 'Senha' : 'Senha (4 números)'}
+                </label>
+                {isEmailLogin ? (
+                  // Pastor: aceita os 4 números de antes ou a senha nova criada pelo e-mail de "esqueci a senha"
+                  <input
+                    type="password"
+                    value={loginPin}
+                    onChange={(e) => setLoginPin(e.target.value)}
+                    className="w-full p-3 border rounded-xl text-base text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
+                  />
+                ) : (
+                  <input
+                    type="tel"
+                    inputMode="numeric"
+                    maxLength={4}
+                    value={loginPin}
+                    onChange={(e) => setLoginPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="0000"
+                    className="w-full p-3 border rounded-xl text-2xl tracking-[0.5em] text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
+                  />
+                )}
               </div>
 
               {loginError && (
                 <p className="text-xs text-red-600 dark:text-red-400 font-bold">{loginError}</p>
+              )}
+              {loginInfo && (
+                <p className="text-xs text-amber-800 dark:text-amber-300 font-bold">{loginInfo}</p>
               )}
 
               <button
@@ -1937,15 +1991,13 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                 <span>Entrar</span>
               </button>
 
-              {wrongPinFor && (
-                <button
-                  onClick={handleForgotMemberPin}
-                  disabled={isLoggingIn}
-                  className="w-full text-xs font-bold text-amber-700 dark:text-amber-400 hover:underline disabled:opacity-50"
-                >
-                  Esqueci a senha — criar senha nova para "{wrongPinFor}"
-                </button>
-              )}
+              <button
+                onClick={handleForgotPin}
+                disabled={isLoggingIn}
+                className="w-full min-h-[40px] text-sm font-bold text-amber-700 dark:text-amber-400 hover:underline disabled:opacity-50"
+              >
+                Esqueci minha senha
+              </button>
 
               <p className="text-[11px] text-stone-400 text-center">
                 Primeira vez? É só digitar um nome e uma senha — sua conta é criada na hora.

@@ -98,17 +98,27 @@ function pinToPassword(pin: string): string {
 /**
  * Logs the Pastor/Admin in with e-mail + PIN. If the account doesn't exist yet
  * (first time using this e-mail), creates it on the spot.
+ * A 4-digit PIN becomes "amanhecer-PIN"; anything longer is used as-is, so the
+ * senha nova criada pelo e-mail de "esqueci a senha" (mín. 6 caracteres) also works.
+ * Throws { code: 'auth/wrong-password' } when the account exists but the senha não confere.
  */
-export async function loginAdmin(email: string, pin: string) {
-  const password = pinToPassword(pin);
+export async function loginAdmin(email: string, secret: string) {
+  const password = /^\d{4}$/.test(secret) ? pinToPassword(secret) : secret;
   const normalizedEmail = email.trim().toLowerCase();
   try {
     const result = await signInWithEmailAndPassword(auth, normalizedEmail, password);
     return result.user;
   } catch (error: any) {
     if (error?.code === 'auth/user-not-found' || error?.code === 'auth/invalid-credential') {
-      const result = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
-      return result.user;
+      try {
+        const result = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
+        return result.user;
+      } catch (createError: any) {
+        if (createError?.code === 'auth/email-already-in-use') {
+          throw { code: 'auth/wrong-password' };
+        }
+        throw createError;
+      }
     }
     throw error;
   }
