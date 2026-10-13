@@ -25,6 +25,8 @@ export const db = (dbId && dbId !== '(default)')
 
 // Initialize Authentication (used only for the Pastor/Admin login)
 export const auth = getAuth();
+// E-mails do Firebase (ex.: "esqueci a senha") e a página do link saem em português
+auth.languageCode = 'pt-BR';
 
 export enum OperationType {
   CREATE = 'create',
