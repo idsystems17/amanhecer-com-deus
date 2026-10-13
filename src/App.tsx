@@ -22,6 +22,7 @@ import {
   Info,
   Calendar,
   Eye,
+  EyeOff,
   Smartphone,
   Share2,
   Mic,
@@ -132,6 +133,7 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
   const [loginPin, setLoginPin] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginInfo, setLoginInfo] = useState<string | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // Firestore Core syncing state (falls back gracefully to localized static build)
@@ -1952,12 +1954,23 @@ const [showInstallHelp, setShowInstallHelp] = useState(false);
                 </label>
                 {isEmailLogin ? (
                   // Pastor: aceita os 4 números de antes ou a senha nova criada pelo e-mail de "esqueci a senha"
-                  <input
-                    type="password"
-                    value={loginPin}
-                    onChange={(e) => setLoginPin(e.target.value)}
-                    className="w-full p-3 border rounded-xl text-base text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
-                  />
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={loginPin}
+                      onChange={(e) => setLoginPin(e.target.value)}
+                      className="w-full p-3 px-12 border rounded-xl text-base text-center font-bold bg-stone-50 dark:bg-zinc-800 border-[#E5E3DF] dark:border-zinc-700"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(v => !v)}
+                      className="absolute right-1 top-1/2 -translate-y-1/2 p-3 text-stone-500 hover:text-stone-800 dark:hover:text-white"
+                      title={showPassword ? 'Esconder senha' : 'Mostrar senha'}
+                      aria-label={showPassword ? 'Esconder senha' : 'Mostrar senha'}
+                    >
+                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                    </button>
+                  </div>
                 ) : (
                   <input
                     type="tel"
